@@ -1054,6 +1054,7 @@
     clearArm=false; clearTimeout(clearArmT);
     objects=[]; selected=null; history.length=0; sceneHasContent=false; sctx.clearRect(0,0,cssW,cssH); toast('Tudo limpo ✨');
     try{ localStorage.removeItem(SAVE_KEY); }catch(e){}
+    if(hasIDB){ idb.del(SAVE_KEY).catch(function(){}); }
   });
   function dataURLtoBlob(d){ const [h,b]=d.split(','); const mime=h.match(/:(.*?);/)[1]; const bin=atob(b); const u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return new Blob([u],{type:mime}); }
   function fallbackDownload(data){ const blob=dataURLtoBlob(data); const u=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=u; a.download='ganhe-vida-'+Date.now()+'.png'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(u),2000); toast('Imagem pronta! Segure a imagem e toque em "Salvar em Fotos" 📷'); }
@@ -1145,6 +1146,28 @@
 
   // ---------- autosave (continua de onde parou) ----------
   const SAVE_KEY='mundoMagico.save.v1';
+  // armazenamento robusto: IndexedDB (sem o limite ~5MB do localStorage, que fazia o desenho sumir no iPad)
+  const hasIDB=(function(){ try{ return !!window.indexedDB; }catch(e){ return false; } })();
+  const idb=(function(){
+    let dbp=null;
+    function open(){
+      if(dbp) return dbp;
+      dbp=new Promise(function(res,rej){
+        try{
+          const r=indexedDB.open('mundoMagico',1);
+          r.onupgradeneeded=function(){ r.result.createObjectStore('kv'); };
+          r.onsuccess=function(){ res(r.result); };
+          r.onerror=function(){ rej(r.error); };
+        }catch(e){ rej(e); }
+      });
+      return dbp;
+    }
+    return {
+      set:function(k,v){ return open().then(function(db){ return new Promise(function(res,rej){ const t=db.transaction('kv','readwrite'); t.objectStore('kv').put(v,k); t.oncomplete=function(){res();}; t.onerror=function(){rej(t.error);}; }); }); },
+      get:function(k){ return open().then(function(db){ return new Promise(function(res,rej){ const t=db.transaction('kv','readonly'); const rq=t.objectStore('kv').get(k); rq.onsuccess=function(){ res(rq.result==null?null:rq.result); }; rq.onerror=function(){rej(rq.error);}; }); }); },
+      del:function(k){ return open().then(function(db){ return new Promise(function(res,rej){ const t=db.transaction('kv','readwrite'); t.objectStore('kv').delete(k); t.oncomplete=function(){res();}; t.onerror=function(){rej(t.error);}; }); }); }
+    };
+  })();
   let saveT=null, started=false;  // só salva depois de iniciar/restaurar — senão a tela em branco do splash sobrescreveria o desenho salvo
   function serializeObjects(){
     return objects.map(o=>{
@@ -1159,14 +1182,22 @@
   }
   function doSave(){
     if(!started) return;   // evita salvar o estado em branco antes do restore
+    let json=null;
     try{
       const data={v:2, sceneType:SCENES[sceneIdx].id, scene:scene.toDataURL('image/png'), objs:serializeObjects()};
-      localStorage.setItem(SAVE_KEY, JSON.stringify(data));
-    }catch(e){ /* sem espaço / aba privada: ignora em silêncio p/ não assustar a criança */ }
+      json=JSON.stringify(data);
+    }catch(e){ return; }
+    if(hasIDB){
+      idb.set(SAVE_KEY, json).catch(function(){ try{ localStorage.setItem(SAVE_KEY, json); }catch(_){} });
+    } else {
+      try{ localStorage.setItem(SAVE_KEY, json); }catch(e){ /* sem espaço / aba privada: ignora em silêncio */ }
+    }
   }
   function scheduleSave(){ clearTimeout(saveT); saveT=setTimeout(doSave,700); }
-  function restoreSave(){
-    let raw=null; try{ raw=localStorage.getItem(SAVE_KEY); }catch(e){ return false; }
+  async function restoreSave(){
+    let raw=null;
+    if(hasIDB){ try{ raw=await idb.get(SAVE_KEY); }catch(e){ raw=null; } }
+    if(!raw){ try{ raw=localStorage.getItem(SAVE_KEY); }catch(e){ raw=null; } }
     if(!raw) return false;
     let data=null; try{ data=JSON.parse(raw); }catch(e){ return false; }
     if(!data) return false;
@@ -1386,7 +1417,7 @@
       master.connect(comp).connect(master||actx.destination);
     }catch(e){}
     const sp=document.getElementById('splash'); sp.classList.add('hide'); setTimeout(()=>sp.style.display='none',460);
-    requestAnimationFrame(()=>{ resize(); const had=restoreSave(); started=true; showHint(had?'Seu desenho voltou! 🎨':'Toque para colocar um peixe 🐟'); });
+    requestAnimationFrame(async ()=>{ resize(); let had=false; try{ had=await restoreSave(); }catch(e){} started=true; showHint(had?'Seu desenho voltou! 🎨':'Toque para colocar um peixe 🐟'); });
   });
 
   resize(); requestAnimationFrame(loop);
