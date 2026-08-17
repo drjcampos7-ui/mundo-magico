@@ -8,33 +8,33 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Probe official listarFundos identity endpoint
+      - name: Test internal fund ID identity resolution
         run: |
           set -euo pipefail
           mkdir -p out
           python - <<'PY'
-          import requests,re,pathlib,json
-          s=requests.Session()
-          base='https://fnet.bmfbovespa.com.br/fnet/publico/'
-          page=s.get(base+'pesquisarGerenciadorDocumentosCVM?tipoFundo=1',timeout=90)
-          page.raise_for_status()
-          tests=[]
-          for term in ['', 'BTG', 'FUNDO']:
-            for pg in [1,2]:
-              try:
-                r=s.get(base+'listarFundos',params={'term':term,'page':pg,'idTipoFundo':1,'idAdm':0,'paraCerts':'false'},timeout=90)
-                rec={'term':term,'page':pg,'status':r.status_code,'content_type':r.headers.get('content-type'),'text_prefix':r.text[:1000]}
-                if r.ok:
-                  try: rec['json']=r.json()
-                  except Exception as e: rec['json_error']=str(e)
-                tests.append(rec)
-              except Exception as e:
-                tests.append({'term':term,'page':pg,'error':type(e).__name__+': '+str(e)})
-          pathlib.Path('out/listarFundos.json').write_text(json.dumps(tests,ensure_ascii=False,indent=2),encoding='utf-8')
+          import requests,json,re,pathlib
+          s=requests.Session(); base='https://fnet.bmfbovespa.com.br/fnet/publico/'
+          s.get(base+'pesquisarGerenciadorDocumentosCVM?tipoFundo=1',timeout=90).raise_for_status()
+          # Official listarFundos result: id 19370 = BTG HOTEL FI / BTG HOTEIS FII (non-holdout probe)
+          p=dict(d=0,s=0,l=20,tipoFundo=1,administrador='',idFundo='19370',idCategoriaDocumento=0,idTipoDocumento=0,idEspecieDocumento=0,situacao='',cnpj='',cnpjFundo='',dataReferencia='',dataInicial='01/01/2019',dataFinal='31/12/2019',idModalidade='',palavraChave='')
+          r=s.get(base+'pesquisarGerenciadorDocumentosDados',params=p,timeout=90); r.raise_for_status(); j=r.json()
+          out={'recordsFiltered':j.get('recordsFiltered'),'rows':j.get('data',[])[:5]}
+          # Also inspect rendered first document for explicit CNPJ
+          if out['rows']:
+            did=out['rows'][0]['id']
+            h=s.get(base+'exibirDocumento',params={'id':did},timeout=90); h.raise_for_status()
+            text=re.sub(r'<[^>]+>',' ',h.text)
+            text=re.sub(r'\s+',' ',text)
+            out['document_id']=did
+            out['candidates_cnpj']=sorted(set(re.findall(r'\d{2}[\.\s]?\d{3}[\.\s]?\d{3}[\s/]?[/]?\d{4}[-\s]?\d{2}',text)))[:20]
+            out['html_has_cnpj_label']=bool(re.search(r'CNPJ\s+(?:do\s+)?Fundo',text,re.I))
+            pathlib.Path('out/document.html').write_text(h.text,encoding='utf-8',errors='ignore')
+          pathlib.Path('out/result.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
           PY
-          sha256sum out/listarFundos.json > out/SHA256SUMS.txt
+          sha256sum out/result.json > out/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: fnet-listar-fundos-probe
+          name: fnet-internal-id-resolution
           path: out
           retention-days: 1
