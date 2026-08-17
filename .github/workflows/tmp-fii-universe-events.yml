@@ -2,6 +2,8 @@ name: tmp-fii-universe-events
 on:
   push:
     branches: [tmp-fii-universe-events-20260817]
+  pull_request:
+    branches: [main]
 permissions:
   contents: read
 jobs:
@@ -21,9 +23,8 @@ jobs:
           set -euo pipefail
           mkdir -p out/text
           python - <<'PY'
-          import os, json, time, hashlib, unicodedata, re, io
+          import os, json, time, hashlib, unicodedata, io
           from pathlib import Path
-          from datetime import date
           import requests
           from requests.adapters import HTTPAdapter
           from urllib3.util.retry import Retry
@@ -40,7 +41,7 @@ jobs:
           quarter_audits=[]; active_fr=[]; lineage_fr=[]
 
           def get_json(params):
-              r=sess.get(base,params=params,timeout=120); r.raise_for_status(); return r.json(),r.url
+              r=sess.get(base,params=params,timeout=120); r.raise_for_status(); return r.json()
 
           for q,sm,em,ed in quarters:
               start=f'01/{sm:02d}/{year}'
@@ -48,31 +49,22 @@ jobs:
               common=dict(d=0,tipoFundo=1,administrador='',idCategoriaDocumento=0,idTipoDocumento=0,idEspecieDocumento=0,situacao='',cnpjFundo='',dataReferencia='',dataInicial=start,dataFinal=end,idModalidade='',palavraChave='')
               s=0; limit=50; rows=[]; expected=None; pages=0; page_log=[]
               while expected is None or len(rows)<expected:
-                  params=common|{'s':s,'l':limit}
-                  j,url=get_json(params); pages+=1
+                  j=get_json(common|{'s':s,'l':limit}); pages+=1
                   if expected is None: expected=int(j.get('recordsFiltered',0))
                   batch=j.get('data',[]) or []
                   page_log.append({'s':s,'received':len(batch)})
                   if not batch: break
-                  rows.extend(batch)
-                  s += len(batch)
-                  time.sleep(0.03)
+                  rows.extend(batch); s += len(batch); time.sleep(0.03)
               complete=(len(rows)==expected)
-              # exact category/situation filter only after global enumeration
               for r in rows:
                   if str(r.get('categoriaDocumento',''))=='Fato Relevante':
                       lineage_fr.append(r)
                       if str(r.get('situacaoDocumento',''))=='A': active_fr.append(r)
               quarter_audits.append({'year':year,'quarter':q,'date_start':start,'date_end':end,'recordsFiltered_first':expected,'rows_collected':len(rows),'pagination_complete':complete,'pages':pages,'page_log':page_log,'fato_relevante_all':sum(str(r.get('categoriaDocumento',''))=='Fato Relevante' for r in rows),'fato_relevante_active':sum(str(r.get('categoriaDocumento',''))=='Fato Relevante' and str(r.get('situacaoDocumento',''))=='A' for r in rows)})
-              if not complete:
-                  raise RuntimeError(f'INCOMPLETE PAGINATION year={year} q={q} expected={expected} got={len(rows)}')
+              if not complete: raise RuntimeError(f'INCOMPLETE PAGINATION year={year} q={q} expected={expected} got={len(rows)}')
 
-          # dedupe exact document IDs, preserving first metadata occurrence
           docs={}
-          for r in active_fr:
-              did=str(r.get('id'))
-              docs.setdefault(did,r)
-
+          for r in active_fr: docs.setdefault(str(r.get('id')),r)
           results=[]
           for idx,(did,r) in enumerate(sorted(docs.items(),key=lambda kv:int(kv[0]))):
               rec={k:r.get(k) for k in ['id','descricaoFundo','nomePregao','informacoesAdicionais','cnpjFundo','dataEntrega','dataReferencia','categoriaDocumento','tipoDocumento','especieDocumento','situacaoDocumento','status','versao','descricaoStatus','fundoOuClasse']}
@@ -83,32 +75,25 @@ jobs:
                   text=''; method=''; err=None
                   try:
                       if b.startswith(b'%PDF') or 'pdf' in rec['content_type'].lower():
-                          reader=PdfReader(io.BytesIO(b),strict=False)
-                          pages=[]
+                          reader=PdfReader(io.BytesIO(b),strict=False); pages=[]
                           for pg in reader.pages:
                               try: pages.append(pg.extract_text() or '')
                               except Exception: pages.append('')
                           text='\n'.join(pages); method='pypdf'
                       else:
-                          # only accept clearly textual responses; never OCR/guess binary
                           ct=rec['content_type'].lower()
                           if ('text/' in ct) or ('html' in ct) or b.lstrip().startswith((b'<',b'{',b'[')):
                               text=b.decode(rr.encoding or 'utf-8',errors='replace'); method='decode'
-                          else:
-                              err='UNSUPPORTED_BINARY_FORMAT'
-                  except Exception as e:
-                      err=type(e).__name__+':'+str(e)
-                  text=unicodedata.normalize('NFC',text).strip()
-                  ok=len(text)>=20
+                          else: err='UNSUPPORTED_BINARY_FORMAT'
+                  except Exception as e: err=type(e).__name__+':'+str(e)
+                  text=unicodedata.normalize('NFC',text).strip(); ok=len(text)>=20
                   rec['extraction_method']=method or None; rec['extraction_ok']=ok; rec['text_char_count']=len(text); rec['extraction_error']=None if ok else (err or 'EMPTY_OR_TOO_SHORT')
-                  if ok:
-                      (out/'text'/f'{did}.txt').write_text(text,encoding='utf-8')
+                  if ok: (out/'text'/f'{did}.txt').write_text(text,encoding='utf-8')
               except Exception as e:
                   rec.update({'byte_count':None,'raw_sha256':None,'content_type':None,'extraction_method':None,'extraction_ok':False,'text_char_count':0,'extraction_error':'DOWNLOAD:'+type(e).__name__+':'+str(e)})
               results.append(rec)
               if idx%25==0: time.sleep(0.1)
 
-          # preserve lineage metadata for inactive/cancelled FR without downloading
           lineage=[{k:r.get(k) for k in ['id','descricaoFundo','nomePregao','informacoesAdicionais','cnpjFundo','dataEntrega','dataReferencia','categoriaDocumento','tipoDocumento','especieDocumento','situacaoDocumento','status','versao','descricaoStatus']} for r in lineage_fr]
           (out/f'quarter_audit_{year}.json').write_text(json.dumps(quarter_audits,ensure_ascii=False,sort_keys=True,indent=2),encoding='utf-8')
           with (out/f'fatos_relevantes_active_{year}.jsonl').open('w',encoding='utf-8') as f:
@@ -117,7 +102,6 @@ jobs:
               for r in lineage: f.write(json.dumps(r,ensure_ascii=False,sort_keys=True)+'\n')
           summary={'year':year,'quarters_complete':all(x['pagination_complete'] for x in quarter_audits),'global_rows':sum(x['rows_collected'] for x in quarter_audits),'active_fr_unique':len(results),'active_fr_extracted':sum(bool(r.get('extraction_ok')) for r in results),'active_fr_extraction_failed':sum(not bool(r.get('extraction_ok')) for r in results)}
           (out/f'summary_{year}.json').write_text(json.dumps(summary,ensure_ascii=False,sort_keys=True,indent=2),encoding='utf-8')
-          # hashes for every output file
           lines=[]
           for p in sorted(out.rglob('*')):
               if p.is_file() and p.name!='SHA256SUMS.txt': lines.append(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+str(p.relative_to(out)))
