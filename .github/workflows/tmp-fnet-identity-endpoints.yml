@@ -8,36 +8,33 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     steps:
-      - name: Inspect Fundos.NET public scripts for identity endpoints
+      - name: Probe official listarFundos identity endpoint
         run: |
           set -euo pipefail
-          mkdir -p out/js
+          mkdir -p out
           python - <<'PY'
-          import requests,re,urllib.parse,pathlib,json
-          sess=requests.Session()
-          base='https://fnet.bmfbovespa.com.br'
-          url=base+'/fnet/publico/pesquisarGerenciadorDocumentosCVM?tipoFundo=1'
-          html=sess.get(url,timeout=90).text
-          pathlib.Path('out/page.html').write_text(html,encoding='utf-8')
-          srcs=re.findall(r'<script[^>]+src=["\']([^"\']+)',html,re.I)
-          found=[]
-          for i,src in enumerate(srcs):
-            u=urllib.parse.urljoin(url,src)
-            try:
-              r=sess.get(u,timeout=90)
-              txt=r.text
-              pathlib.Path(f'out/js/{i:02d}.js').write_text(txt,encoding='utf-8',errors='ignore')
-              for m in re.finditer(r'[^\n]{0,180}(?:fundo|Fundo|autocomplete|pesquisar|listar|cnpj)[^\n]{0,260}',txt,re.I):
-                line=m.group(0)
-                if '/fnet/' in line or 'publico' in line or '$.ajax' in line or 'url' in line.lower():
-                  found.append({'script':u,'text':line[:500]})
-            except Exception as e:
-              found.append({'script':u,'error':str(e)})
-          pathlib.Path('out/endpoints.json').write_text(json.dumps({'scripts':srcs,'matches':found},ensure_ascii=False,indent=2),encoding='utf-8')
+          import requests,re,pathlib,json
+          s=requests.Session()
+          base='https://fnet.bmfbovespa.com.br/fnet/publico/'
+          page=s.get(base+'pesquisarGerenciadorDocumentosCVM?tipoFundo=1',timeout=90)
+          page.raise_for_status()
+          tests=[]
+          for term in ['', 'BTG', 'FUNDO']:
+            for pg in [1,2]:
+              try:
+                r=s.get(base+'listarFundos',params={'term':term,'page':pg,'idTipoFundo':1,'idAdm':0,'paraCerts':'false'},timeout=90)
+                rec={'term':term,'page':pg,'status':r.status_code,'content_type':r.headers.get('content-type'),'text_prefix':r.text[:1000]}
+                if r.ok:
+                  try: rec['json']=r.json()
+                  except Exception as e: rec['json_error']=str(e)
+                tests.append(rec)
+              except Exception as e:
+                tests.append({'term':term,'page':pg,'error':type(e).__name__+': '+str(e)})
+          pathlib.Path('out/listarFundos.json').write_text(json.dumps(tests,ensure_ascii=False,indent=2),encoding='utf-8')
           PY
-          sha256sum out/page.html out/endpoints.json > out/SHA256SUMS.txt
+          sha256sum out/listarFundos.json > out/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: fnet-identity-endpoint-audit
+          name: fnet-listar-fundos-probe
           path: out
           retention-days: 1
