@@ -1,0 +1,68 @@
+name: tmp-fnet-global-enum-2019-2023
+on:
+  push:
+    branches: [tmp-fnet-fii-bridge]
+permissions:
+  contents: read
+jobs:
+  enumerate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enumerate global Fundos.NET quarterly and locally filter Fato Relevante
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python - <<'PY'
+          import requests,json,time,datetime,calendar,concurrent.futures,pathlib,hashlib
+          BASE='https://fnet.bmfbovespa.com.br/fnet/publico/pesquisarGerenciadorDocumentosDados'
+          L=50
+          def quarter_bounds(y,q):
+              m=1+(q-1)*3; lastm=m+2
+              d1=datetime.date(y,m,1)
+              d2=datetime.date(y,lastm,calendar.monthrange(y,lastm)[1])
+              return d1.strftime('%d/%m/%Y'),d2.strftime('%d/%m/%Y')
+          def get_page(params,tries=6):
+              last=None
+              for k in range(tries):
+                  try:
+                      r=requests.get(BASE,params=params,timeout=(15,90))
+                      r.raise_for_status(); return r.json()
+                  except Exception as e:
+                      last=e; time.sleep(min(2**k,20))
+              raise RuntimeError(str(last))
+          def enum_quarter(y,q):
+              di,df=quarter_bounds(y,q); s=0; rows=[]; total=None; pages=0
+              common=dict(d=0,l=L,tipoFundo=1,administrador='',idFundo='',idCategoriaDocumento=0,idTipoDocumento=0,idEspecieDocumento=0,situacao='',cnpj='',cnpjFundo='',dataReferencia='',dataInicial=di,dataFinal=df,idModalidade='',palavraChave='')
+              while total is None or s<total:
+                  p=dict(common); p['s']=s
+                  j=get_page(p); pages+=1
+                  if total is None: total=int(j.get('recordsFiltered') or 0)
+                  batch=j.get('data') or []
+                  rows.extend(batch)
+                  if not batch: break
+                  s += len(batch)
+              complete=(len(rows)==total)
+              fr=[r for r in rows if str(r.get('categoriaDocumento','')).strip()=='Fato Relevante' and str(r.get('situacaoDocumento','')).strip()=='A']
+              return {'year':y,'quarter':q,'dataInicial':di,'dataFinal':df,'recordsFiltered':total,'rows_collected':len(rows),'pages':pages,'complete':complete,'fato_relevante_active_count':len(fr),'fato_relevante_rows':fr}
+          quarters=[(y,q) for y in range(2019,2024) for q in range(1,5)]
+          results=[]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+              futs={ex.submit(enum_quarter,y,q):(y,q) for y,q in quarters}
+              for fut in concurrent.futures.as_completed(futs):
+                  y,q=futs[fut]
+                  try: results.append(fut.result())
+                  except Exception as e: results.append({'year':y,'quarter':q,'complete':False,'error':type(e).__name__+': '+str(e)})
+          results=sorted(results,key=lambda x:(x['year'],x['quarter']))
+          pathlib.Path('out/fnet_global_fatos_relevantes_2019_2023.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          summary=[{k:r.get(k) for k in ['year','quarter','dataInicial','dataFinal','recordsFiltered','rows_collected','pages','complete','fato_relevante_active_count','error']} for r in results]
+          pathlib.Path('out/completeness.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          if not all(r.get('complete') for r in results):
+              raise SystemExit('INCOMPLETE_QUARTER')
+          PY
+          sha256sum out/*.json > out/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fnet-global-fii-2019-2023
+          path: out
+          retention-days: 1
