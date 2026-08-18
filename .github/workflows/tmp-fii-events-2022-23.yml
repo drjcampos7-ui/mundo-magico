@@ -1,0 +1,27 @@
+name: tmp-fii-events-2022-23
+on:
+  push:
+    branches: [tmp-fii-events-2022-23]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  collect:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        year: [2022, 2023]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet pypdf requests
+      - run: python scripts/fnet_fii_events_robust.py
+        env:
+          YEAR: ${{ matrix.year }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fnet-fii-events-robust-${{ matrix.year }}
+          path: out
+          retention-days: 1
