@@ -1,0 +1,92 @@
+name: tmp-fnet-protocol-2020
+on:
+  push:
+    branches: [tmp-fnet-protocol-2020]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download prior certified 2020 artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -fL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/9306148712/zip" \
+            -o source.zip
+          mkdir source
+          unzip -q source.zip -d source
+      - name: Fetch protocol pages
+        run: |
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re,time,hashlib,unicodedata
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor,as_completed
+          import requests
+          from bs4 import BeautifulSoup
+
+          src=Path('source/fatos_relevantes_active_2020.jsonl')
+          if not src.exists():
+              hits=list(Path('source').rglob('fatos_relevantes_active_2020.jsonl'))
+              if not hits: raise SystemExit('SOURCE_JSONL_NOT_FOUND')
+              src=hits[0]
+          rows=[json.loads(x) for x in src.read_text(encoding='utf-8').splitlines() if x.strip()]
+          ids=sorted({str(r['document_id']) for r in rows},key=int)
+          out=Path('out'); out.mkdir()
+          url='https://fnet.bmfbovespa.com.br/fnet/publico/visualizarProtocoloDocumentoCVM'
+          cnpj_re=re.compile(r'(?<!\d)(\d{2}[.\s]?\d{3}[.\s]?\d{3}[\/\s]?\d{4}[-\s]?\d{2})(?!\d)')
+          def canon(s): return re.sub(r'\D','',s)
+          def get_same(did):
+              last=None
+              for k in range(8):
+                  try:
+                      r=requests.get(url,params={'idDocumento':did},timeout=45)
+                      if r.status_code<500 and r.status_code!=429:
+                          r.raise_for_status(); return r
+                      last=f'HTTP_{r.status_code}'
+                  except Exception as e: last=type(e).__name__+':'+str(e)
+                  time.sleep(min(10,k+1))
+              raise RuntimeError(str(last))
+          def one(did):
+              rec={'document_id':did}
+              try:
+                  r=get_same(did); b=r.content
+                  soup=BeautifulSoup(b,'html.parser')
+                  text=unicodedata.normalize('NFC',' '.join(soup.stripped_strings))
+                  matches=[]
+                  for m in cnpj_re.finditer(text):
+                      s=max(0,m.start()-180); e=min(len(text),m.end()+180)
+                      matches.append({'cnpj14':canon(m.group(1)),'context':text[s:e]})
+                  rec.update({'http_ok':True,'byte_count':len(b),'raw_sha256':hashlib.sha256(b).hexdigest(),'text':text,'cnpj_occurrences':matches})
+              except Exception as e:
+                  rec.update({'http_ok':False,'error':type(e).__name__+':'+str(e),'text':'','cnpj_occurrences':[]})
+              return rec
+          results=[]
+          with ThreadPoolExecutor(max_workers=8) as ex:
+              futs=[ex.submit(one,d) for d in ids]
+              for f in as_completed(futs): results.append(f.result())
+          results.sort(key=lambda x:int(x['document_id']))
+          with (out/'protocol_2020.jsonl').open('w',encoding='utf-8') as f:
+              for r in results: f.write(json.dumps(r,ensure_ascii=False,sort_keys=True)+'\n')
+          summary={'expected_docs':len(ids),'http_ok':sum(r['http_ok'] for r in results),'http_fail':sum(not r['http_ok'] for r in results),'with_any_cnpj':sum(bool(r['cnpj_occurrences']) for r in results)}
+          (out/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True),encoding='utf-8')
+          hs=[]
+          for p in sorted(out.iterdir()):
+              if p.is_file(): hs.append(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name)
+          (out/'SHA256SUMS.txt').write_text('\n'.join(hs)+'\n',encoding='utf-8')
+          print(json.dumps(summary))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fnet-protocol-2020
+          path: out
+          retention-days: 1
